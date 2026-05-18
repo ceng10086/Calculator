@@ -1,17 +1,19 @@
 package com.example.calculator;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 
 import com.example.calculator.InputItem.InputType;
 
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Message;
-import android.annotation.SuppressLint;
-import android.app.Activity;
+import android.os.Messenger;
+import android.os.Process;
 import android.util.Log;
 import android.view.View;
 import android.view.View.OnClickListener;
@@ -20,8 +22,8 @@ import android.view.animation.AnimationUtils;
 import android.widget.Button;
 import android.widget.TextView;
 
-public class MainActivity extends Activity implements OnClickListener{
-	
+public class MainActivity extends Activity implements OnClickListener {
+
 	private TextView mShowResultTv;  //显示结果
 	private TextView mShowInputTv;   //显示输入的字符
 	private Button mCBtn;
@@ -42,27 +44,53 @@ public class MainActivity extends Activity implements OnClickListener{
 	private Button mNineBtn;
 	private Button mPointtn;
 	private Button mEqualBtn;
-	private HashMap<View,String> map; //将View和Stringӳ映射起来
+	private HashMap<View,String> map; //将View和String映射起来
 	private List<InputItem> mInputList; //定义记录每次输入的数
 	private int mLastInputstatus = INPUT_NUMBER; //记录上一次输入状态
-	public static final int INPUT_NUMBER = 1; 
+	public static final int INPUT_NUMBER = 1;
 	public static final int INPUT_POINT = 0;
 	public static final int INPUT_OPERATOR = -1;
 	public static final int END = -2;
 	public static final int ERROR= -3;
-	public static final int SHOW_RESULT_DATA = 1;
+
+	// Handler message types. 使用大于 OP_DIV(=4) 的值，避免与 Mathservice 回传的 what 冲突。
+	public static final int SHOW_RESULT_DATA = 100;
+	public static final int MSG_NEXT_STEP = 101;
+
+	// 四则混合运算的两个阶段：高优先级（*, /），低优先级（+, -）
+	private static final int PHASE_HIGH = 1;
+	private static final int PHASE_LOW = 2;
+
 	public static final String nan = "NaN";
 	public static final String infinite = "∞";
-	public static final String TAG="calculator";
+	public static final String TAG = "calculator";
+
+	// 异步计算状态
+	private int mPhase = PHASE_HIGH;
+	private boolean mComputing = false;
+	private int mCurrentTaskId = 0;
+	private int mPendingTaskId = -1;
+	private int mPendingOpIdx = -1;
+	private int mPendingOp = 0;
+	private boolean mPendingLeftWasInt;
+	private boolean mPendingRightWasInt;
+	private Messenger mMessenger;
+
 	@SuppressLint("HandlerLeak")
-	private Handler mHandler = new Handler(){
+	private Handler mHandler = new Handler() {
 
 		public void handleMessage(Message msg) {
-			
-			if(msg.what == SHOW_RESULT_DATA){
-				mShowResultTv.setText(mShowInputTv.getText());
-				mShowInputTv.setText(mInputList.get(0).getInput());
-				clearScreen(mInputList.get(0));
+			Log.i(TAG, "Handler receive msg what=" + msg.what + " arg1=" + msg.arg1
+					+ " PID=" + Process.myPid()
+					+ " TID=" + Process.myTid()
+					+ " ThreadName=" + Thread.currentThread().getName());
+
+			if (msg.what == SHOW_RESULT_DATA) {
+				finalizeComputation();
+			} else if (msg.what == MSG_NEXT_STEP) {
+				stepNext();
+			} else if (msg.what >= Mathservice.OP_ADD && msg.what <= Mathservice.OP_DIV) {
+				handleServiceResult(msg);
 			}
 		}
 	};
@@ -72,8 +100,13 @@ public class MainActivity extends Activity implements OnClickListener{
 	protected void onCreate(Bundle savedInstanceState) {
 		super.onCreate(savedInstanceState);
 		setContentView(R.layout.activity_main);
-		initView(); 
-		initData(); 
+		mMessenger = new Messenger(mHandler);
+		Log.i(TAG, "MainActivity onCreate"
+				+ " PID=" + Process.myPid()
+				+ " TID=" + Process.myTid()
+				+ " ThreadName=" + Thread.currentThread().getName());
+		initView();
+		initData();
 	}
 	/**
 	 * 初始化view
@@ -100,7 +133,7 @@ public class MainActivity extends Activity implements OnClickListener{
 		mEqualBtn= (Button)this.findViewById(R.id.equal_btn);
 		mSubBtn = (Button)this.findViewById(R.id.sub_btn);
 		setOnClickListener();//调用监听事件
-		
+
 	}
 	/**
 	 * 初始化数据
@@ -125,7 +158,6 @@ public class MainActivity extends Activity implements OnClickListener{
 		map.put(mPointtn,getResources().getString(R.string.point));
 		map.put(mEqualBtn,getResources().getString(R.string.equal));
 		mInputList = new ArrayList<InputItem>();
-		//mShowInputTv.setText("input");
 		mShowResultTv.setText("");
 		clearAllScreen();
 	}
@@ -159,6 +191,10 @@ public class MainActivity extends Activity implements OnClickListener{
 	 */
 	@Override
 	public void onClick(View arg0) {
+        // 异步计算过程中忽略按键，避免状态混乱
+        if (mComputing) {
+            return;
+        }
         int id = arg0.getId();
         if (id == R.id.c_btn) {
             clearAllScreen();
@@ -175,21 +211,173 @@ public class MainActivity extends Activity implements OnClickListener{
         }
 	}
 	/**
-	 * 点击=之后开始运算
+	 * 点击 = 后启动异步运算流程：先处理高优先级（*, /），再处理低优先级（+, -）。
+	 * 每一步运算都通过 Mathservice 的 4 个子线程完成，结果通过 Handler 回到主线程。
 	 */
 	private void operator() {
 		if(mLastInputstatus == END ||mLastInputstatus == ERROR || mLastInputstatus == INPUT_OPERATOR|| mInputList.size()==1){
 			return;
 		}
+		mComputing = true;
 		mShowResultTv.setText("");
 		startAnim();
-		findHighOperator(0);
-		if(mLastInputstatus != ERROR){
-			findLowOperator(0);
-		}
-		mHandler.sendMessageDelayed(mHandler.obtainMessage(SHOW_RESULT_DATA), 300);
+		mPhase = PHASE_HIGH;
+		Log.i(TAG, "operator() start async compute"
+				+ " PID=" + Process.myPid()
+				+ " TID=" + Process.myTid());
+		// 略作延时以让动画启动，再开始计算
+		mHandler.sendEmptyMessageDelayed(MSG_NEXT_STEP, 50);
 	}
-	
+
+	/**
+	 * 推进下一步运算：根据当前阶段在 mInputList 中找到第一个对应优先级的运算符，
+	 * 若有则交给 Mathservice 计算；若没有则切换阶段或结束。
+	 */
+	private void stepNext() {
+		if (mLastInputstatus == ERROR) {
+			mHandler.sendEmptyMessageDelayed(SHOW_RESULT_DATA, 250);
+			return;
+		}
+		int idx = findIndexOfPhaseOperator(mPhase);
+		if (idx == -1) {
+			if (mPhase == PHASE_HIGH) {
+				mPhase = PHASE_LOW;
+				stepNext();
+			} else {
+				mHandler.sendEmptyMessageDelayed(SHOW_RESULT_DATA, 250);
+			}
+			return;
+		}
+		sendComputeRequest(idx);
+	}
+
+	private int findIndexOfPhaseOperator(int phase) {
+		if (mInputList == null || mInputList.size() <= 1) {
+			return -1;
+		}
+		String add = getResources().getString(R.string.add);
+		String sub = getResources().getString(R.string.sub);
+		String mul = getResources().getString(R.string.multply);
+		String div = getResources().getString(R.string.divide);
+		for (int i = 0; i < mInputList.size(); i++) {
+			String s = mInputList.get(i).getInput();
+			if (phase == PHASE_HIGH && (mul.equals(s) || div.equals(s))) {
+				return i;
+			}
+			if (phase == PHASE_LOW && (add.equals(s) || sub.equals(s))) {
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	/**
+	 * 把第 idx 处的二元运算交给 Mathservice 执行。
+	 */
+	private void sendComputeRequest(int idx) {
+		InputItem opItem = mInputList.get(idx);
+		InputItem leftItem = mInputList.get(idx - 1);
+		InputItem rightItem = mInputList.get(idx + 1);
+		String opStr = opItem.getInput();
+		int op;
+		if (getResources().getString(R.string.add).equals(opStr)) {
+			op = Mathservice.OP_ADD;
+		} else if (getResources().getString(R.string.sub).equals(opStr)) {
+			op = Mathservice.OP_SUB;
+		} else if (getResources().getString(R.string.multply).equals(opStr)) {
+			op = Mathservice.OP_MUL;
+		} else {
+			op = Mathservice.OP_DIV;
+		}
+
+		double a = Double.parseDouble(leftItem.getInput());
+		double b = Double.parseDouble(rightItem.getInput());
+
+		mCurrentTaskId++;
+		mPendingTaskId = mCurrentTaskId;
+		mPendingOpIdx = idx;
+		mPendingOp = op;
+		mPendingLeftWasInt = leftItem.getType() == InputType.INT_TYPE;
+		mPendingRightWasInt = rightItem.getType() == InputType.INT_TYPE;
+
+		Intent intent = new Intent(this, Mathservice.class);
+		intent.putExtra(Mathservice.EXTRA_A, a);
+		intent.putExtra(Mathservice.EXTRA_B, b);
+		intent.putExtra(Mathservice.EXTRA_OP, op);
+		intent.putExtra(Mathservice.EXTRA_TASK_ID, mPendingTaskId);
+		intent.putExtra(Mathservice.EXTRA_MESSENGER, mMessenger);
+
+		Log.i(TAG, "sendComputeRequest a=" + a + " b=" + b + " op=" + op
+				+ " taskId=" + mPendingTaskId
+				+ " PID=" + Process.myPid()
+				+ " TID=" + Process.myTid());
+
+		startService(intent);
+	}
+
+	/**
+	 * 处理 Mathservice 中某个子线程通过 Handler 回传的运算结果。
+	 * 一次请求会有 4 个子线程回传，本方法只采用 op 匹配的那一个，其余忽略。
+	 */
+	private void handleServiceResult(Message msg) {
+		if (msg.arg1 != mPendingTaskId) {
+			return; // 过期消息
+		}
+		if (msg.what != mPendingOp) {
+			return; // 非匹配子线程的结果，丢弃
+		}
+
+		Bundle data = msg.getData();
+		double result = data.getDouble(Mathservice.DATA_RESULT);
+		boolean error = data.getBoolean(Mathservice.DATA_ERROR);
+
+		if (error) {
+			// 除零错误
+			mLastInputstatus = ERROR;
+			double a = Double.parseDouble(mInputList.get(mPendingOpIdx - 1).getInput());
+			if (a == 0) {
+				clearScreen(new InputItem(nan, InputType.ERROR));
+			} else {
+				clearScreen(new InputItem(infinite, InputType.ERROR));
+			}
+			mHandler.sendEmptyMessageDelayed(SHOW_RESULT_DATA, 250);
+			return;
+		}
+
+		// 根据操作数类型决定结果是 INT 还是 DOUBLE
+		boolean wholeNumber = !Double.isInfinite(result) && result == Math.floor(result);
+		int resultType;
+		String resultStr;
+		if (mPendingLeftWasInt && mPendingRightWasInt && wholeNumber) {
+			resultType = InputType.INT_TYPE;
+			resultStr = String.valueOf((long) result);
+		} else {
+			resultType = InputType.DOUBLE_TYPE;
+			resultStr = String.valueOf(result);
+		}
+
+		mInputList.set(mPendingOpIdx - 1, new InputItem(resultStr, resultType));
+		mInputList.remove(mPendingOpIdx + 1);
+		mInputList.remove(mPendingOpIdx);
+
+		Log.i(TAG, "applied result=" + resultStr + " remaining=" + mInputList.size()
+				+ " PID=" + Process.myPid() + " TID=" + Process.myTid());
+
+		mHandler.sendEmptyMessage(MSG_NEXT_STEP);
+	}
+
+	private void finalizeComputation() {
+		if (mInputList != null && mInputList.size() > 0) {
+			mShowResultTv.setText(mShowInputTv.getText());
+			mShowInputTv.setText(mInputList.get(0).getInput());
+			clearScreen(mInputList.get(0));
+		}
+		mComputing = false;
+		Log.i(TAG, "finalizeComputation done"
+				+ " PID=" + Process.myPid()
+				+ " TID=" + Process.myTid());
+	}
+
 	private void startAnim(){
 		mShowInputTv.setText(mShowInputTv.getText()+getResources().getString(R.string.equal));
 		Animation anim = AnimationUtils.loadAnimation(this, R.anim.screen_anim);
@@ -210,7 +398,7 @@ public class MainActivity extends Activity implements OnClickListener{
 		String input = mShowInputTv.getText().toString();
 		if(mLastInputstatus == INPUT_OPERATOR){
 			input = input+"0";
-		} 
+		}
 		mShowInputTv.setText(input+key);
 		addInputList(INPUT_POINT, key);
 	}
@@ -223,11 +411,9 @@ public class MainActivity extends Activity implements OnClickListener{
 			clearInputScreen();
 		}
 		String key = map.get(view);
-		Log.i(TAG,"line 235 key="+ key);
+		Log.i(TAG,"inputNumber key="+ key);
 
 		if("0".equals(mShowInputTv.getText().toString())){
-			Log.i(TAG,"line 235 mShowInputTv.getText().toString()="+ mShowInputTv.getText().toString());
-
 			mShowInputTv.setText(key);
 		}else{
 		mShowInputTv.setText(mShowInputTv.getText() + key);
@@ -317,15 +503,15 @@ public class MainActivity extends Activity implements OnClickListener{
 	}
 	//清理屏
 	private void clearAllScreen() {
-		
+
 		clearResultScreen();
 		clearInputScreen();
-		
+
 	}
 	private void clearResultScreen(){
 		mShowResultTv.setText("");
 	}
-	
+
 	private void clearInputScreen() {
 		mShowInputTv.setText(getResources().getString(R.string.zero));
 		mLastInputstatus = INPUT_NUMBER;
@@ -340,148 +526,7 @@ public class MainActivity extends Activity implements OnClickListener{
 		mInputList.clear();
 		mInputList.add(item);
 	}
-	
-	//实现高级运算
-	public int findHighOperator(int index) {
-		if (mInputList.size() > 1 && index >= 0 && index < mInputList.size())
-			for (int i = index; i < mInputList.size(); i++) {
-					InputItem item = mInputList.get(i);
-				if (getResources().getString(R.string.divide).equals(item.getInput())
-						|| getResources().getString(R.string.multply).equals(item.getInput())) {
-					int a,b; double c,d;
-					if(mInputList.get(i - 1).getType() == InputItem.InputType.INT_TYPE){
-						a = Integer.parseInt(mInputList.get(i - 1).getInput());
-						if(mInputList.get(i + 1).getType() == InputItem.InputType.INT_TYPE){
-							b = Integer.parseInt(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.multply).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(a * b),InputItem.InputType.INT_TYPE));
-							}else{
-								if(b == 0){
-									mLastInputstatus = ERROR;
-									if(a==0){
-										clearScreen(new InputItem(nan,InputType.ERROR));
-									}else{
-										clearScreen(new InputItem(infinite,InputType.ERROR));
-									}
-									return -1;
-								}else if(a % b != 0){
-									mInputList.set(i - 1,new InputItem(String.valueOf((double)a / b),InputItem.InputType.DOUBLE_TYPE));
-								}else{
-									mInputList.set(i - 1,new InputItem(String.valueOf((Integer)a / b),InputItem.InputType.INT_TYPE));
-								}
-							}
-						}else{
-							d = Double.parseDouble(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.multply).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(a * d),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								if(d == 0){
-									mLastInputstatus = ERROR;
-									if(a==0){
-										clearScreen(new InputItem(nan,InputType.ERROR));
-									}else{
-										clearScreen(new InputItem(infinite,InputType.ERROR));
-									}
-									return -1;
-								}
-								mInputList.set(i - 1,new InputItem(String.valueOf(a / d),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}
-					}else{
-						c = Double.parseDouble(mInputList.get(i-1).getInput());
-						if(mInputList.get(i + 1).getType() == InputItem.InputType.INT_TYPE){
-							b = Integer.parseInt(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.multply).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(c* b),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								if(b== 0){
-									mLastInputstatus = ERROR;
-									if(c==0){
-										clearScreen(new InputItem(nan,InputType.ERROR));
-									}else{
-										clearScreen(new InputItem(infinite,InputType.ERROR));
-									}
-									return -1;
-								}
-								mInputList.set(i - 1,new InputItem(String.valueOf(c / b),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}else{
-							d = Double.parseDouble(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.multply).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(mul(c,d)),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								if(d == 0){
-									mLastInputstatus = ERROR;
-									if(c==0){
-										clearScreen(new InputItem(nan,InputType.ERROR));
-									}else{
-										clearScreen(new InputItem(infinite,InputType.ERROR));
-									}
-									return -1;
-								}
-								mInputList.set(i - 1,new InputItem(String.valueOf(div(c, d)),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}
-					}
-					mInputList.remove(i + 1);
-					mInputList.remove(i);
-					return findHighOperator(i);
-				}
-			}
-		return -1;
 
-	}
-	
-	public int findLowOperator(int index) {
-		if (mInputList.size()>1 && index >= 0 && index < mInputList.size())
-			for (int i = index; i < mInputList.size(); i++) {
-					InputItem item = mInputList.get(i);
-				if (getResources().getString(R.string.sub).equals(item.getInput())
-						|| getResources().getString(R.string.add).equals(item.getInput())) {
-					int a,b; double c,d;
-					if(mInputList.get(i - 1).getType() == InputItem.InputType.INT_TYPE){
-						a = Integer.parseInt(mInputList.get(i - 1).getInput());
-						if(mInputList.get(i + 1).getType() == InputItem.InputType.INT_TYPE){
-							b = Integer.parseInt(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.add).equals(item.getInput())){
-							mInputList.set(i - 1,new InputItem( String.valueOf(a + b),InputItem.InputType.INT_TYPE));
-							}else{
-							mInputList.set(i - 1,new InputItem(String.valueOf(a - b),InputItem.InputType.INT_TYPE));	
-							}
-						}else{
-							d = Double.parseDouble(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.add).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(a + d),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								mInputList.set(i - 1,new InputItem(String.valueOf(a - d),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}
-					}else{
-						c = Double.parseDouble(mInputList.get(i-1).getInput());
-						if(mInputList.get(i + 1).getType() == InputItem.InputType.INT_TYPE){
-							b = Integer.parseInt(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.add).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(c + b),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								mInputList.set(i - 1,new InputItem(String.valueOf(c - b),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}else{
-							d = Double.parseDouble(mInputList.get(i + 1).getInput());
-							if(getResources().getString(R.string.add).equals(item.getInput())){
-								mInputList.set(i - 1,new InputItem( String.valueOf(add(c, d)),InputItem.InputType.DOUBLE_TYPE));
-							}else{
-								mInputList.set(i - 1,new InputItem(String.valueOf(sub(c,d)),InputItem.InputType.DOUBLE_TYPE));	
-							}
-						}
-					}
-					mInputList.remove(i + 1);
-					mInputList.remove(i);
-					return findLowOperator(i);
-				}
-			}
-		return -1;
-
-	}
 	//currentStatus 当前状态  9  "9" "+"
 	void addInputList(int currentStatus,String inputChar){
 		switch (currentStatus) {
@@ -510,7 +555,7 @@ public class MainActivity extends Activity implements OnClickListener{
 		case INPUT_POINT://point
 			 if(mLastInputstatus == INPUT_OPERATOR){
 				 InputItem item1 =  new InputItem("0"+inputChar,InputItem.InputType.DOUBLE_TYPE);
-				 mInputList.add(item1); 
+				 mInputList.add(item1);
 				 mLastInputstatus = INPUT_POINT;
 			}else{
 				InputItem item1 = (InputItem)mInputList.get(mInputList.size()-1);
@@ -521,28 +566,4 @@ public class MainActivity extends Activity implements OnClickListener{
 			break;
 		}
 	}
-	
-	   public static Double div(Double v1,Double v2){
-	        BigDecimal b1 = new BigDecimal(v1.toString());
-	        BigDecimal b2 = new BigDecimal(v2.toString());
-	        return b1.divide(b2,10,BigDecimal.ROUND_HALF_UP).doubleValue();
-	    }
-	   
-	   public static Double sub(Double v1,Double v2){
-	        BigDecimal b1 = new BigDecimal(v1.toString());
-	        BigDecimal b2 = new BigDecimal(v2.toString());
-	        return b1.subtract(b2).doubleValue();
-	    }
-	   
-	   public static Double add(Double v1,Double v2){
-	        BigDecimal b1 = new BigDecimal(v1.toString());
-	        BigDecimal b2 = new BigDecimal(v2.toString());
-	        return b1.add(b2).doubleValue();
-	    }
-	   
-	   public static Double mul(Double v1,Double v2){
-	        BigDecimal b1 = new BigDecimal(v1.toString());
-	        BigDecimal b2 = new BigDecimal(v2.toString());
-	        return b1.multiply(b2).doubleValue();
-	    }
 }

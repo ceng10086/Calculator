@@ -3,10 +3,6 @@
     android:versionCode="1"
     android:versionName="1.0" >
 
-    <uses-sdk
-        android:minSdkVersion="8"
-        android:targetSdkVersion="17" />
-
     <application
         android:allowBackup="true"
         android:icon="@drawable/icon"
@@ -14,14 +10,19 @@
         android:theme="@style/AppTheme" >
         <activity
             android:name="com.example.calculator.MainActivity"
-            android:label="@string/app_name" 
+            android:label="@string/app_name"
             android:theme="@android:style/Theme.Black.NoTitleBar"
+            android:exported="true"
             >
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name="com.example.calculator.Mathservice"
+            android:exported="false" />
     </application>
 
 </manifest>
